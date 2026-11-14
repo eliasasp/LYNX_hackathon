@@ -405,6 +405,7 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR, segments=None):
     pos, units_a, units_b, trade = 0, 0.0, 0.0, None
     blocked = False  # efter stop-loss/failsafe: vänta tills |z| < Z_ENTRY, annars öppnas samma förlustaffär igen direkt
     active, started, k, v_cur = False, False, 0, None
+    v_par = None  # screeningen som S, band och alpha_t/beta_t kommer från (behålls när paret blir underkänt)
     days, trades = [], []
     for t in prices.index[prices.index >= segments[0][0]]:
         # 0. Ny screening från och med dag t: byt till dess parametrar. Med rullande beta är spreaden densamma, så de
@@ -416,6 +417,7 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR, segments=None):
             active, v_cur = v_k is not None, v_k
             if active and not same:
                 (S, lam_mean, lam_std, std_train, swing, swing_train, lam_swing, vr, z_entry), running = _band_params(v_k)
+                v_par = v_k
                 if not started or not ROLLING_BETA:
                     mean, var, n_all, sumsq_all, swing_var = running
                     started = True
@@ -463,7 +465,7 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR, segments=None):
                 pos = +1
             if pos != 0:
                 # Lås dagens alpha och beta för affären: det är dem enheterna nedan bygger på.
-                alpha_in, beta_in = v["alpha_t"][t], v["beta_t"][t]
+                alpha_in, beta_in = v_par["alpha_t"][t], v_par["beta_t"][t]
                 # Kapitalviktning med beta: B-benet får beta * kapital så att benens procentuella rörelser tar ut varandra.
                 # Antalet enheter låses på dagens priser och hålls tills positionen stängs.
                 units_a = pos * capital / prices.at[t, a]
@@ -482,7 +484,7 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR, segments=None):
         elif pos != 0:
             if REHEDGE:  # hedga om till dagens beta: det vi håller är spreaden S som handlas
                 units_a = pos * capital / prices.at[t, a]
-                units_b = -pos * capital * v["beta_t"][t] / prices.at[t, b]
+                units_b = -pos * capital * v_par["beta_t"][t] / prices.at[t, b]
                 s_trade = s
             else:        # spreaden för de låsta enheterna (alpha/beta från inträdet) – det är den som ger PnL
                 s_trade = log_a[t] - (alpha_in + beta_in * log_b[t])

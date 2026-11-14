@@ -1,3 +1,9 @@
 .venv/
 __pycache__/
 .DS_Store
+
+# genererade filer
+output/
+pairs_trading/pairs_*.csv
+ma_crossover/final_positions*
+lynx_submission/

@@ -1,36 +1,40 @@
-"""Kombinerad modell: tre strategier körs på samma data och vägs ihop med lika risk.
+"""Inlämningsmodell: två strategier körs på samma data och vägs ihop 60/40 (merged/pairs).
 
-    david  ma_crossover/final_model.py   MA10/250-trend på 18 instrument
-    linn   strategy/submission.py        trend (3 tidsskalor) + makro (BNP/KPI), lika risk per tillgångsslag
-    pairs  pairs_trading/pairs_final.py  pairs trading med kointegration
-    merged Linns modell där trenddelen = Linns hysteres-momentum + Davids MA10/250 (DAVID_TREND_SHARE);
-           Linns egen MA-crossover är borttagen
+    merged  strategy/submission.py + ma_crossover/final_model.py
+            Linns trend (hysteres-momentum, 100/250/500 d) + Davids MA10/250 (DAVID_TREND_SHARE av
+            trendrisken) + makro (BNP/KPI, ridge), lika risk per tillgångsslag
+    pairs   pairs_trading/pairs_final.py
+            pairs trading med kointegration, omscreening var RESCREEN_DAYS:e dag
 
-Gemensam tidshorisont för alla strategier:
+Tidshorisont:
     träning   < VALIDATION_START   ingen handel (alla positioner 0)
-    validering ≥ VALIDATION_START  handel; alla nyckeltal räknas bara här
+    validering ≥ VALIDATION_START  handel; nyckeltalen räknas bara här
 
-David och Linn är walk-forward (varje dag används bara data t.o.m. den dagen), så de räknas på hela
-historiken och nollas före VALIDATION_START. Pairs skattar urval, alpha/beta och half-life på de sista
+Merged är walk-forward (varje dag används bara data t.o.m. den dagen), så den räknas på hela historiken
+och nollas före VALIDATION_START. Pairs skattar urval, alpha/beta och half-life på de sista
 PAIRS_TRAIN_YEARS åren före VALIDATION_START och handlar därefter.
 
-Positionerna läggs på hela universumet (0 där en strategi inte handlar) och kombineras med Linns
-combine_positions: varje strategi skalas walk-forward till samma P&L-vol, bara med historisk P&L, och
-vägs enligt WEIGHTS. Därefter portföljöverlägg på hela portföljen (portfolio_scale): villkorad volbroms
-(VOL_BRAKE) och volmål (TARGET_VOL). Ingen strategi skiftas här; evaluation.py lägger på t+2-laggen.
+Strategierna kombineras med combine_positions: var och en skalas walk-forward till samma P&L-vol (bara
+historisk P&L) och vägs enligt WEIGHTS. Därefter portföljöverlägg på hela portföljen (portfolio_scale):
+villkorad volbroms (VOL_BRAKE) och volmål (TARGET_VOL). Positionen daterad T använder bara data t.o.m. T;
+evaluation.py lägger på t+2-laggen.
+
+Inlämningsfilen har samma format som Lynx exempel (positions.write_csv): kolumnen AsOfDate + en kolumn
+per instrument, en rad per dag i prisfilen.
 
 Kör från repo-roten:
-    .venv/bin/python main.py                       # insample-data, skriver output/main_positions.csv + nyckeltal
-    .venv/bin/python main.py --plot                # visar dashboard + positions- och riskplottar i fönster
-    .venv/bin/python main.py --save-plots          # sparar samma plottar som PNG i stället
-    .venv/bin/python main.py --prices full.csv --macro full_macro.csv --output positions.csv
+    .venv/bin/python main.py                       # insample-data → output/submission.csv + nyckeltal
+    .venv/bin/python main.py --plot                # visar även dashboard, positions- och riskplottar
+    .venv/bin/python main.py --save-plots          # sparar plottarna som PNG i output/ i stället
+    .venv/bin/python main.py --prices full_prices.csv --macro full_macro.csv
+                                                   # INLÄMNING: kör på hela datan (insample + out of sample)
 
 Allt skrivs till mappen output/ (ett --output med egen mapp eller absolut sökväg används som det är).
---plot visar och --save-plots sparar, bredvid --output (för main_positions.csv):
-    main_positions.png             evaluation.py:s dashboard för den kombinerade modellen
-    main_positions_tillgangar.png  riskposition per tillgång över tiden, uppdelad per strategi + kombinerad
-    main_positions_exponering.png  brutto riskexponering per strategi och tillgångsslag, snitt per tillgång
-    main_positions_risk.png        portföljvol (realiserad och ex ante) och riskbidrag per strategi/tillgångsslag
+--plot visar och --save-plots sparar, bredvid --output:
+    submission.png             evaluation.py:s dashboard för den kombinerade modellen
+    submission_tillgangar.png  riskposition per tillgång över tiden, per strategi + kombinerad
+    submission_exponering.png  brutto riskexponering per strategi och tillgångsslag, snitt per tillgång
+    submission_risk.png        portföljvol (realiserad och ex ante) och riskbidrag per strategi/tillgångsslag
 """
 
 from __future__ import annotations
@@ -55,9 +59,8 @@ import evaluation  # noqa: E402
 import submission as linn  # noqa: E402
 from combine import combine_positions, risk_scale, strategy_pnl  # noqa: E402
 from overlays import conditional_vol_target  # noqa: E402
-from lead_lag import lead_lag_positions, load_prices  # noqa: E402
-from macro import asset_class, load_macro  # noqa: E402
-from macro_joint import macro_joint_positions  # noqa: E402
+from lead_lag import load_prices  # noqa: E402
+from macro import asset_class  # noqa: E402
 from ma_crossover import final_model as david  # noqa: E402
 from pairs_trading import pairs_final as pairs  # noqa: E402
 
@@ -68,14 +71,8 @@ OUTPUT_DIR = ROOT / "output"  # alla filer som main.py skriver (positioner, plot
 VALIDATION_START = date(2010, 1, 1)  # träning före (ingen handel), validering från och med detta datum
 PAIRS_TRAIN_YEARS = 2                # pairs skattas på [VALIDATION_START - så många år, dagen före VALIDATION_START]
 
-# Andel av risken per strategi (normaliseras till summa 1) för de strategier som körs.
-#   linn     = Linns hela submission (trend + makro, gruppvikter, volbroms)
-#   leadlag  = bara Linns lead-lag-komponent (LL_CONFIG i strategy/submission.py)
-#   macro    = bara Linns makrokomponent (gemensam ridge, samma inställningar som i submission.py)
-#   merged   = en modell: Linns submission där trenden är hennes hysteres + Davids MA10/250 (ingen Linn-MA)
-#   standard (merged, pairs): 80 / 20 % av risken
-WEIGHTS = {"merged": 0.8, "david": 0.4, "linn": 0.4, "leadlag": 1.0, "macro": 1.0, "pairs": 0.2}
-DEFAULT_STRATEGIES = ("merged", "pairs")  # körs utan --strategies
+# Andel av risken per strategi (normaliseras till summa 1)
+WEIGHTS = {"merged": 0.6, "pairs": 0.4}
 DAVID_TREND_SHARE = 0.7  # i merged: Davids MA-andel av trendrisken (resten Linns hysteres på 100/250/500 dagar)
 # Portföljöverlägg på hela den kombinerade portföljen (alla strategier, efter viktningen)
 VOL_BRAKE = True          # villkorad volbroms: vol 20 d (EWMA) > linn.VOL_THRESHOLD × vol 250 d → skala ner till lång nivå
@@ -99,37 +96,14 @@ def _no_trading_before(positions: pl.DataFrame, start: date) -> pl.DataFrame:
     return positions.with_columns(pl.when(pl.col(DATE) >= start).then(pl.col(c)).otherwise(0.0).alias(c) for c in inst)
 
 
-def david_positions(prices: pl.DataFrame) -> pl.DataFrame:
-    return david.make_positions(prices)
-
-
-def linn_positions(prices: pl.DataFrame, macro_path: str | None) -> pl.DataFrame:
-    return linn.build_positions(prices, macro_path)
-
-
 def merged_positions(prices: pl.DataFrame, macro_path: str | None) -> pl.DataFrame:
     """Linns modell där trenddelen är hennes hysteres-momentum (hennes MA-crossover avstängd) plus Davids
     MA10/250. Davids positioner läggs på hela universumet (0 utanför hans 18 instrument) och allt går sedan
     genom Linns gruppvikter, makro och volbroms."""
-    return linn.build_positions(prices, macro_path, extra_trend=_on_universe(david_positions(prices), prices),
+    david_pos = _on_universe(david.make_positions(prices), prices)
+    return linn.build_positions(prices, macro_path, extra_trend=david_pos,
                                 extra_trend_share=DAVID_TREND_SHARE, use_ma_cross=False,
                                 vol_brake=not VOL_BRAKE)  # volbromsen ligger då på hela portföljen i stället
-
-
-def leadlag_positions(prices: pl.DataFrame) -> pl.DataFrame:
-    return lead_lag_positions(prices, linn.LL_CONFIG)
-
-
-def macro_positions(prices: pl.DataFrame, macro_path: str | None) -> pl.DataFrame:
-    """Linns makrokomponent med hennes inställningar. Tillgångsslag med makroandel 0 i submission.py
-    (MACRO_SHARE_BY_GROUP, dvs obligationer) får inga makropositioner, precis som i hennes modell."""
-    if macro_path is None:
-        raise ValueError("makrostrategin kräver --macro")
-    raw = load_macro(macro_path, prices, lag=linn.MACRO_LAG)
-    pos = macro_joint_positions(prices, raw, windows=linn.MACRO_WINDOWS, train_window=linn.MACRO_TRAIN_WINDOW,
-                                ridge=linn.MACRO_RIDGE, max_pos=linn.MACRO_MAX_POS)
-    off = [c for c in pos.columns if c != DATE and linn.MACRO_SHARE_BY_GROUP.get(asset_class(c), 1) <= 0]
-    return pos.with_columns(pl.lit(0.0).alias(c) for c in off)
 
 
 def pairs_positions(prices: pl.DataFrame) -> pl.DataFrame:
@@ -146,20 +120,15 @@ def pairs_positions(prices: pl.DataFrame) -> pl.DataFrame:
 
 
 def build_all(prices: pl.DataFrame, macro_path: str | None) -> dict[str, pl.DataFrame]:
-    """Kör alla strategier med vikt > 0 och lägger dem på hela universumet (hela historiken, före nollning)."""
+    """Kör strategierna och lägger dem på hela universumet (hela historiken, före nollning)."""
     runners = {
         "merged": lambda: merged_positions(prices, macro_path),
-        "david": lambda: david_positions(prices),
-        "linn": lambda: linn_positions(prices, macro_path),
-        "leadlag": lambda: leadlag_positions(prices),
-        "macro": lambda: macro_positions(prices, macro_path),
         "pairs": lambda: pairs_positions(prices),
     }
     out = {}
     for name, run in runners.items():
-        if WEIGHTS.get(name, 0) > 0:
-            print(f"  kör {name} ...", flush=True)
-            out[name] = _on_universe(run(), prices)
+        print(f"  kör {name} ...", flush=True)
+        out[name] = _on_universe(run(), prices)
     return out
 
 
@@ -243,8 +212,7 @@ VOL_WINDOW = 100  # dagar: rullande prisvol per instrument och kovarians för ex
 ANN = float(np.sqrt(evaluation.TRADING_DAYS_PER_YEAR))
 COMBINED = "KOMBINERAD"
 CLASSES = ["bonds", "stocks", "fx", "råvaror"]  # macro.asset_class
-COLORS = {"merged": "#d4a017", "david": "#2a78d6", "linn": "#eb6834", "leadlag": "#8e44c9", "macro": "#c2185b", "pairs": "#1baf7a",
-          COMBINED: "#0b0b0b"}
+COLORS = {"merged": "#d4a017", "pairs": "#1baf7a", COMBINED: "#0b0b0b"}
 CLASS_COLORS = {"bonds": "#eda100", "stocks": "#e87ba4", "fx": "#008300", "råvaror": "#6250d6"}
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
 
@@ -463,20 +431,31 @@ def plot_risk(d: dict) -> Figure:
 
 
 # ===================================== MAIN =====================================
+def build_positions(prices: pl.DataFrame, macro_path: str | None) -> tuple[dict[str, pl.DataFrame], pl.DataFrame]:
+    """Strategiernas råa positioner (hela historiken) och den kombinerade, nollad före VALIDATION_START."""
+    raw = build_all(prices, macro_path)  # hela historiken; riskskalningen behöver P&L även före validering
+    combined = _no_trading_before(combine(raw, prices), VALIDATION_START)
+    assert combined.null_count().sum_horizontal().item() == 0, "positionerna innehåller tomma värden"
+    return raw, combined
+
+
+def to_submission(combined: pl.DataFrame) -> pl.DataFrame:
+    """Samma format som Lynx exempel: AsOfDate + en kolumn per instrument, bara från VALIDATION_START
+    (historiken före används ändå för signaler och riskskalning, men där är alla positioner 0)."""
+    return combined.filter(pl.col(DATE) >= VALIDATION_START)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--prices", default=str(ROOT / "close_prices_insample.csv"))
     parser.add_argument("--macro", default=str(ROOT / "macro_data_insample.csv"),
-                        help="makrofil till Linns strategi; ange 'none' för att köra utan makro")
-    parser.add_argument("--output", default="main_positions.csv",
-                        help=f"positionsfil; ett filnamn utan mapp hamnar i {OUTPUT_DIR.name}/")
+                        help="makrofil till merged; ange 'none' för att köra utan makro")
+    parser.add_argument("--output", default="submission.csv",
+                        help=f"inlämningsfil; ett filnamn utan mapp hamnar i {OUTPUT_DIR.name}/")
     parser.add_argument("--no-eval", action="store_true", help="hoppa över nyckeltal")
     parser.add_argument("--plot", action="store_true",
                         help="visa dashboard, positions- och riskplottar i fönster på datorn")
     parser.add_argument("--save-plots", action="store_true", help="spara även plottarna som PNG bredvid --output")
-    parser.add_argument("--strategies", nargs="+", choices=list(WEIGHTS),
-                        help=f"vilka strategier som körs (standard: {' '.join(DEFAULT_STRATEGIES)}), "
-                             "t.ex. --strategies david leadlag macro pairs")
     args = parser.parse_args()
     macro_path = None if args.macro.lower() == "none" else args.macro
     output = Path(args.output)
@@ -484,19 +463,16 @@ def main() -> None:
         output = OUTPUT_DIR / output
     output.parent.mkdir(parents=True, exist_ok=True)
     args.output = str(output)
-    selected = args.strategies or DEFAULT_STRATEGIES
-    for n in WEIGHTS:
-        if n not in selected:
-            WEIGHTS[n] = 0.0
 
     prices = load_prices(args.prices)
     print(f"Priser: {prices.height} dagar, {prices.width - 1} instrument, {prices[DATE][0]} – {prices[DATE][-1]}")
     print(f"Träning (ingen handel) < {VALIDATION_START} ≤ validering\n")
-    raw = build_all(prices, macro_path)  # hela historiken; riskskalningen behöver P&L även före validering
-    combined = _no_trading_before(combine(raw, prices), VALIDATION_START)
+    raw, combined = build_positions(prices, macro_path)
     strategies = {n: _no_trading_before(p, VALIDATION_START) for n, p in raw.items()}
-    combined.write_csv(args.output)
-    print(f"Kombinerade positioner sparade: {args.output}\n")
+    submission = to_submission(combined)
+    submission.write_csv(args.output)
+    print(f"Inlämningsfil sparad: {args.output} ({submission.height} dagar, {submission.width - 1} instrument, "
+          f"{submission[DATE][0]} – {submission[DATE][-1]})\n")
 
     if not args.no_eval:
         print(f"Nyckeltal (med kostnader), validering {VALIDATION_START} – {prices[DATE][-1]}")
