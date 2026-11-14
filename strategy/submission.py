@@ -93,11 +93,17 @@ TRAIN_FRAC = 0.7  # används bara om VALIDATION_START är None: andel av dagarna
 COMPRESS_GAMMA = 1.0  # positionsstorlek efter signalstyrka: 1 = proportionell, <1 krymper starka, >1 förstärker
 
 
-def build_positions(prices: pl.DataFrame, macro_path: str | None = None) -> pl.DataFrame:
+def build_positions(prices: pl.DataFrame, macro_path: str | None = None,
+                    extra_trend: pl.DataFrame | None = None, extra_trend_share: float = 0.0,
+                    use_ma_cross: bool = USE_MA_CROSS, vol_brake: bool = True) -> pl.DataFrame:
+    """use_ma_cross=False: Linns trend består bara av hysteres-momentum.
+    vol_brake=False: hoppa över den villkorade volbromsen (när den läggs på en större portfölj i stället).
+    extra_trend: ytterligare trendpositioner (t.ex. Davids MA10/250, på hela universumet) som vägs in i
+    trenddelen med andelen extra_trend_share av trendrisken, före gruppvikter, makro och volbroms."""
     speeds = {}
     for sp in TREND_SPEEDS:
         parts = {}
-        if USE_MA_CROSS:
+        if use_ma_cross:
             parts["ma_cross"] = ma_cross_tanh_positions(prices, pairs=((sp // 4, sp),), k=TANH_K)
         if USE_HYSTERESIS:
             parts["hysteresis"] = hysteresis_trend_positions(prices, windows=(sp // 2, sp), enter=HYST_ENTER, exit=HYST_EXIT)
@@ -105,6 +111,9 @@ def build_positions(prices: pl.DataFrame, macro_path: str | None = None) -> pl.D
     if USE_BREAKOUT:
         speeds["breakout"] = breakout_positions(prices, windows=TREND_WINDOWS)
     trend = next(iter(speeds.values())) if len(speeds) == 1 else combine_positions(speeds, prices)
+    if extra_trend is not None and extra_trend_share > 0:
+        trend = combine_positions({"own": trend, "extra": extra_trend}, prices,
+                                  {"own": 1 - extra_trend_share, "extra": extra_trend_share})
     if USE_LEAD_LAG:
         strategies = {"trend": trend, "lead_lag": lead_lag_positions(prices, LL_CONFIG)}
         base = {"trend": TREND_RISK_SHARE, "lead_lag": 1 - TREND_RISK_SHARE}
@@ -145,7 +154,8 @@ def build_positions(prices: pl.DataFrame, macro_path: str | None = None) -> pl.D
         combined = combine_positions({"core": combined, "macro": macro}, prices,
                                      {"core": 1 - MACRO_RISK_SHARE, "macro": MACRO_RISK_SHARE})
     combined = compress_risk(combined, prices, gamma=COMPRESS_GAMMA)
-    positions = conditional_vol_target(combined, prices, threshold=VOL_THRESHOLD, days=1, mode="reduce")
+    positions = (conditional_vol_target(combined, prices, threshold=VOL_THRESHOLD, days=1, mode="reduce")
+                 if vol_brake else combined)
 
     # Skydd: evaluation.py kraschar om ett instrument bara har nollor
     empty = [c for c in _instruments(positions) if positions[c].abs().sum() == 0]

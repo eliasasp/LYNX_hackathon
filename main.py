@@ -3,6 +3,8 @@
     david  ma_crossover/final_model.py   MA10/250-trend på 18 instrument
     linn   strategy/submission.py        trend (3 tidsskalor) + makro (BNP/KPI), lika risk per tillgångsslag
     pairs  pairs_trading/pairs_final.py  pairs trading med kointegration
+    merged Linns modell där trenddelen = Linns hysteres-momentum + Davids MA10/250 (DAVID_TREND_SHARE);
+           Linns egen MA-crossover är borttagen
 
 Gemensam tidshorisont för alla strategier:
     träning   < VALIDATION_START   ingen handel (alla positioner 0)
@@ -14,7 +16,8 @@ PAIRS_TRAIN_YEARS åren före VALIDATION_START och handlar därefter.
 
 Positionerna läggs på hela universumet (0 där en strategi inte handlar) och kombineras med Linns
 combine_positions: varje strategi skalas walk-forward till samma P&L-vol, bara med historisk P&L, och
-vägs enligt WEIGHTS. Ingen strategi skiftas här; evaluation.py lägger på t+2-laggen.
+vägs enligt WEIGHTS. Därefter portföljöverlägg på hela portföljen (portfolio_scale): villkorad volbroms
+(VOL_BRAKE) och volmål (TARGET_VOL). Ingen strategi skiftas här; evaluation.py lägger på t+2-laggen.
 
 Kör från repo-roten:
     .venv/bin/python main.py                       # insample-data, skriver output/main_positions.csv + nyckeltal
@@ -51,6 +54,7 @@ sys.path.insert(1, str(ROOT / "strategy"))  # Linns moduler importerar varandra 
 import evaluation  # noqa: E402
 import submission as linn  # noqa: E402
 from combine import combine_positions, risk_scale, strategy_pnl  # noqa: E402
+from overlays import conditional_vol_target  # noqa: E402
 from lead_lag import lead_lag_positions, load_prices  # noqa: E402
 from macro import asset_class, load_macro  # noqa: E402
 from macro_joint import macro_joint_positions  # noqa: E402
@@ -68,8 +72,15 @@ PAIRS_TRAIN_YEARS = 2                # pairs skattas på [VALIDATION_START - så
 #   linn     = Linns hela submission (trend + makro, gruppvikter, volbroms)
 #   leadlag  = bara Linns lead-lag-komponent (LL_CONFIG i strategy/submission.py)
 #   macro    = bara Linns makrokomponent (gemensam ridge, samma inställningar som i submission.py)
-WEIGHTS = {"david": 1.0, "linn": 1.0, "leadlag": 1.0, "macro": 1.0, "pairs": 1.0}
-DEFAULT_STRATEGIES = ("david", "linn", "pairs")  # körs utan --strategies
+#   merged   = en modell: Linns submission där trenden är hennes hysteres + Davids MA10/250 (ingen Linn-MA)
+#   standard (merged, pairs): 80 / 20 % av risken
+WEIGHTS = {"merged": 0.8, "david": 0.4, "linn": 0.4, "leadlag": 1.0, "macro": 1.0, "pairs": 0.2}
+DEFAULT_STRATEGIES = ("merged", "pairs")  # körs utan --strategies
+DAVID_TREND_SHARE = 0.7  # i merged: Davids MA-andel av trendrisken (resten Linns hysteres på 100/250/500 dagar)
+# Portföljöverlägg på hela den kombinerade portföljen (alla strategier, efter viktningen)
+VOL_BRAKE = True          # villkorad volbroms: vol 20 d (EWMA) > linn.VOL_THRESHOLD × vol 250 d → skala ner till lång nivå
+TARGET_VOL = 10.0         # volmål: årlig P&L-vol i evaluation.py:s enhet (positioner × prisförändring); None = av
+TARGET_VOL_WINDOW = 250   # dagar realiserad portfölj-P&L som volmålet skattas på (bara historik)
 KEY_FIGURES = ["adjusted_sharpe", "sharpe", "sharpe_1d_lag", "skewness", "kurtosis", "av_holding", "position_bias"]
 
 
@@ -94,6 +105,15 @@ def david_positions(prices: pl.DataFrame) -> pl.DataFrame:
 
 def linn_positions(prices: pl.DataFrame, macro_path: str | None) -> pl.DataFrame:
     return linn.build_positions(prices, macro_path)
+
+
+def merged_positions(prices: pl.DataFrame, macro_path: str | None) -> pl.DataFrame:
+    """Linns modell där trenddelen är hennes hysteres-momentum (hennes MA-crossover avstängd) plus Davids
+    MA10/250. Davids positioner läggs på hela universumet (0 utanför hans 18 instrument) och allt går sedan
+    genom Linns gruppvikter, makro och volbroms."""
+    return linn.build_positions(prices, macro_path, extra_trend=_on_universe(david_positions(prices), prices),
+                                extra_trend_share=DAVID_TREND_SHARE, use_ma_cross=False,
+                                vol_brake=not VOL_BRAKE)  # volbromsen ligger då på hela portföljen i stället
 
 
 def leadlag_positions(prices: pl.DataFrame) -> pl.DataFrame:
@@ -128,6 +148,7 @@ def pairs_positions(prices: pl.DataFrame) -> pl.DataFrame:
 def build_all(prices: pl.DataFrame, macro_path: str | None) -> dict[str, pl.DataFrame]:
     """Kör alla strategier med vikt > 0 och lägger dem på hela universumet (hela historiken, före nollning)."""
     runners = {
+        "merged": lambda: merged_positions(prices, macro_path),
         "david": lambda: david_positions(prices),
         "linn": lambda: linn_positions(prices, macro_path),
         "leadlag": lambda: leadlag_positions(prices),
@@ -142,20 +163,47 @@ def build_all(prices: pl.DataFrame, macro_path: str | None) -> dict[str, pl.Data
     return out
 
 
+def portfolio_scale(positions: pl.DataFrame, prices: pl.DataFrame) -> np.ndarray:
+    """Faktor per dag för hela portföljen, bara från P&L känd vid dagen:
+    1. volbroms (VOL_BRAKE): 1/kvot när vol 20 d / vol 250 d > linn.VOL_THRESHOLD, annars 1
+    2. volmål (TARGET_VOL): TARGET_VOL / realiserad årlig vol (TARGET_VOL_WINDOW dagar) för den bromsade
+       portföljen; 0 innan 100 dagars P&L finns."""
+    scale = np.ones(positions.height)
+    if VOL_BRAKE:
+        positions, active, ratio = conditional_vol_target(positions, prices, threshold=linn.VOL_THRESHOLD, days=1,
+                                                          mode="reduce", return_state=True)
+        scale = np.where(active, 1.0 / ratio, 1.0)
+    if TARGET_VOL:
+        pnl = pl.Series(strategy_pnl(positions, prices)).replace(0.0, None)
+        vol = pnl.rolling_std(TARGET_VOL_WINDOW, min_samples=100).forward_fill().to_numpy()
+        vol = vol * np.sqrt(evaluation.TRADING_DAYS_PER_YEAR)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            scale = scale * np.nan_to_num(TARGET_VOL / vol, nan=0.0, posinf=0.0)
+    return scale
+
+
+def _weighted(strategies: dict[str, pl.DataFrame], prices: pl.DataFrame) -> pl.DataFrame:
+    return combine_positions(strategies, prices, {n: WEIGHTS[n] for n in strategies})
+
+
 def combine(strategies: dict[str, pl.DataFrame], prices: pl.DataFrame) -> pl.DataFrame:
     """Riskskalningen använder strategiernas kausala positioner även under träningen (simulerad historisk P&L,
-    känd vid varje dag), så att vikterna är på plats från första valideringsdagen."""
-    return combine_positions(strategies, prices, {n: WEIGHTS[n] for n in strategies})
+    känd vid varje dag), så att vikterna är på plats från första valideringsdagen. Sedan portföljöverlägg."""
+    weighted = _weighted(strategies, prices)
+    inst = [c for c in weighted.columns if c != DATE]
+    scaled = weighted.select(inst).to_numpy() * portfolio_scale(weighted, prices)[:, None]
+    return pl.DataFrame(scaled, schema=inst).insert_column(0, weighted[DATE])
 
 
 def strategy_parts(strategies: dict[str, pl.DataFrame], prices: pl.DataFrame) -> dict[str, pl.DataFrame]:
     """Varje strategis del av den kombinerade positionen: samma formel som combine_positions
-    (riskandel × walk-forward-skala × position), så summan över strategierna är den kombinerade positionen."""
+    (riskandel × walk-forward-skala × portföljöverlägg × position), så summan över strategierna är den kombinerade positionen."""
     total = sum(WEIGHTS[n] for n in strategies)
+    overlay = portfolio_scale(_weighted(strategies, prices), prices)
     out = {}
     for n, pos in strategies.items():
         inst = [c for c in pos.columns if c != DATE]
-        scale = (WEIGHTS[n] / total) * risk_scale(pos, prices)
+        scale = (WEIGHTS[n] / total) * risk_scale(pos, prices) * overlay
         out[n] = pl.DataFrame(pos.select(inst).to_numpy() * scale[:, None], schema=inst).insert_column(0, pos[DATE])
     return out
 
@@ -195,7 +243,7 @@ VOL_WINDOW = 100  # dagar: rullande prisvol per instrument och kovarians för ex
 ANN = float(np.sqrt(evaluation.TRADING_DAYS_PER_YEAR))
 COMBINED = "KOMBINERAD"
 CLASSES = ["bonds", "stocks", "fx", "råvaror"]  # macro.asset_class
-COLORS = {"david": "#2a78d6", "linn": "#eb6834", "leadlag": "#8e44c9", "macro": "#c2185b", "pairs": "#1baf7a",
+COLORS = {"merged": "#d4a017", "david": "#2a78d6", "linn": "#eb6834", "leadlag": "#8e44c9", "macro": "#c2185b", "pairs": "#1baf7a",
           COMBINED: "#0b0b0b"}
 CLASS_COLORS = {"bonds": "#eda100", "stocks": "#e87ba4", "fx": "#008300", "råvaror": "#6250d6"}
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
