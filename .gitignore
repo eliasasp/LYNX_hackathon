@@ -6,4 +6,3 @@ __pycache__/
 output/
 pairs_trading/pairs_*.csv
 ma_crossover/final_positions*
-lynx_submission/
