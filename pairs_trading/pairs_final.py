@@ -8,7 +8,7 @@ Upplägg:
                      Med REQUIRE_COINT handlas bara par som klarar alla fyra kraven.
   3. FAS 2 – handel: dag för dag efter träningen räknas en z-score för bruset med EWMA (minne = parets half-life).
                      Stor avvikelse → öppna position mot jämvikten. Stäng när bruset är tillbaka vid medel,
-                     vid stop-loss eller när failsafe-nivån nås.
+                     vid stop-loss eller när failsafe-nivån nås (failsafe är avstängd som standard).
   4. Utvärdering: affärslista + Lynx nyckeltal (evaluation.py).
 
 Kör filen direkt; vad som skrivs ut och plottas styrs av inställningarna nedan.
@@ -49,8 +49,19 @@ TRAIN_END   = "2014-12-31"  # handel från första handelsdagen efter TRAIN_END 
 
 N_TRADE_PAIRS = 15     # kandidater: de N mest korrelerade paren. Korrelationen mäts bara på träningsperioden,
                        #   alltså på det som var känt när handeln börjar (ingen lookahead i urvalet)
-MIN_CORR      = 0.4    # ... och bara par med minst denna korrelation (dagliga prisförändringar).
+MIN_CORR      = 0.8    # ... och bara par med minst denna korrelation (dagliga prisförändringar).
                        #   0.4 släpper in alla 15 (det 15:e paret har 0.47 på 2013–14); screeningen nedan gör urvalet
+
+# ---------- Löpande omscreening ----------
+RESCREEN_DAYS   = 50    # None = urval och screening görs EN gång på träningsperioden och gäller hela handelsperioden.
+                        #   Heltal = gör om urval + screening var RESCREEN_DAYS:e handelsdag (t.ex. 250 ≈ ett år) på de
+                        #   senaste RESCREEN_WINDOW dagarna. Par som inte längre klarar kraven öppnar inga nya affärer
+                        #   (en öppen affär sköts tills den stängs); nya par som klarar kraven börjar handlas.
+APPROVAL_DAYS   = 250   # ett godkännande gäller så här många handelsdagar (250 ≈ ett år) från screeningen: paret får
+                        #   öppna affärer så länge det har klarat minst en screening inom APPROVAL_DAYS. None = bara
+                        #   fram till nästa screening
+RESCREEN_WINDOW = 1250  # fönster i handelsdagar bakåt för varje omscreening (1250 ≈ 5 år; 3 år gav för många tillfälliga
+                        #   par). None = lika långt som träningsperioden
 
 # ---------- Screening: krav på brustermen i TRÄNINGSDATAN för att ett kandidatpar ska få handlas ----------
 REQUIRE_COINT = True   # True = bara par som klarar ALLA fyra kraven nedan handlas. False = alla kandidater handlas
@@ -68,11 +79,16 @@ MIN_CROSS_PER_YEAR = 8   # 4) minst så många nollgenomgångar per år (bruster
 # ---------- Spread och EWMA (hur z-scoren räknas) ----------
 ROLLING_BETA = True     # True = alpha och beta skattas löpande med rullande OLS på de senaste BETA_WINDOW dagarna
                         #   (bara data t.o.m. dagen före). False = låsta från träningen → spreaden driver när relationen ändras
-BETA_WINDOW  = 250      # fönster i handelsdagar för rullande OLS (250–365 är rimligt)
-SPAN_MEAN_MULT = 1.5    # EWMA-span för MEDELVÄRDET = SPAN_MEAN_MULT × half-life.
+BETA_WINDOW  = 750      # fönster i handelsdagar för rullande OLS. 750 ≈ 3 år: med 250 anpassar sig alpha/beta så
+                        #   snabbt att spreaden återgår till 0 av sig själv (utan vinst), 1250 hänger inte med
+MEAN_MODE = "noll"      # vad bandet centreras kring:
+                        #   "ewma" = rörligt EWMA-medel med span SPAN_MEAN_MULT × half-life (följer spreaden)
+                        #   "noll" = fast 0. Spreaden är residualen från en regression med konstant, så dess jämvikt
+                        #            är 0; bandet blir 0 ± Z·std, rör sig inte med dagsbruset och innehåller alltid 0
+SPAN_MEAN_MULT = 1.5    # EWMA-span för MEDELVÄRDET = SPAN_MEAN_MULT × half-life (bara MEAN_MODE = "ewma").
                         #   1–1.5 = följer långsam drift i jämvikten (kräver FREEZE_AT_ENTRY = True),
                         #   5–10  = trögt medel som tvingar fram hård mean reversion (träffar stop oftare om paret bryts)
-STD_MODE = "shrink"     # hur bandbredden (std) räknas:
+STD_MODE = "expanding"  # hur bandbredden (std) räknas:
                         #   "ewma"      = EWMA med span SPAN_STD
                         #   "shrink"    = SHRINK_W · std från träningen + (1 − SHRINK_W) · EWMA-std  (förankrade band)
                         #   "expanding" = std på alla avvikelser från TRAIN_START t.o.m. dag t  (nästan konstanta band)
@@ -80,18 +96,22 @@ STD_MODE = "shrink"     # hur bandbredden (std) räknas:
 SPAN_STD = 250          # EWMA-span i dagar för std, fast och oberoende av half-life (250–500 = långsamma band).
                         #   None = samma span som medelvärdet (det gamla beteendet)
 SHRINK_W = 0.7          # vikt på träningsperiodens std när STD_MODE = "shrink"
-BAND_SCALE = "nivå"     # vad banden förankras i (startvärde för std och ankaret i "shrink"):
+BAND_SCALE = "avvikelse"  # vad banden förankras i (startvärde för std och ankaret i "shrink"):
                         #   "nivå"      = spreadens spridning i träningen, inkl. långsam drift → bredare, försiktigare band
                         #                 (1.4–1.8× den typiska avvikelsen från medlet, mest för par med lång half-life)
                         #   "avvikelse" = typisk avvikelse från EWMA-medlet i träningen = samma sak som z-scoren mäter,
                         #                 så z = 1 är exakt en typisk avvikelse → smalare band och fler affärer
+REHEDGE = True          # True = hedga om positionen varje dag med dagens beta och priser (kapital i A, beta · kapital i B),
+                        #   så att det vi håller alltid är spreaden som handlas; exit och failsafe mäts på den.
+                        #   False = antal enheter och beta låses vid inträdet: hedgen glider när beta och priserna ändras
+                        #   och spreaden för de låsta enheterna kan driva iväg så att affären aldrig stängs
 FREEZE_AT_ENTRY = True  # True = lås medel och std när positionen öppnas; exit och stop-loss mäts mot de låsta värdena,
                         #   så en affär kan bara stängas "vid medel" om spreaden faktiskt har gått tillbaka
 
 # ---------- Skydd mot trend / random walk i spreaden ----------
 VOL_ADAPT     = False  # True = vidga ALLA gränser (in, ut, stop, failsafe) när spreaden svänger kraftigare än i träningen.
                        #   Svängningarna mäts över SWING_HORIZON dagar, alltså bortom det kortsiktiga dagsbruset. Aldrig smalare.
-SWING_HORIZON = 20     # svängningar = förändring i spreaden över så här många dagar
+SWING_HORIZON = 40     # svängningar = förändring i spreaden över så här många dagar
 SWING_SPAN    = 60     # EWMA-span i dagar för hur stora svängningarna är just nu
 ENTRY_CONFIRM = False  # True = gå inte in medan spreaden fortfarande rör sig utåt: vänta tills z vänder tillbaka in över ±Z_ENTRY
 TREND_FILTER  = False  # True = inga nya affärer när spreaden de senaste VR_WINDOW dagarna betett sig som trend/random walk
@@ -99,12 +119,15 @@ VR_WINDOW     = 120    # fönster i dagar för variance ratio VR = Var(SWING_HOR
 VR_MAX        = 1.0    # ny affär bara om VR < VR_MAX  (VR < 1 = återgång mot medel, ≈ 1 = random walk, > 1 = trend)
 
 # ---------- In- och utgångar ----------
-Z_ENTRY = 1.5   # öppna när |z| > Z_ENTRY
-Z_EXIT  = 0.25  # stäng när z har gått tillbaka till ±Z_EXIT (gapet Z_ENTRY − Z_EXIT = förväntad vinst per affär i std)
+ENTRY_FREQ = 0.2  # dynamisk inträdesgräns: per par och screening sätts gränsen så att spreaden låg utanför bandet
+                  #   ENTRY_FREQ av dagarna i screeningfönstret (0.2 ≈ var 5:e dag), dvs. (1 − ENTRY_FREQ)-kvantilen av |z|.
+                  #   Par med tjocka svansar / långa svängningar får högre gräns. None = fast Z_ENTRY för alla par
+Z_ENTRY = 1.5   # fast inträdesgräns, används bara när ENTRY_FREQ = None: öppna när |z| > Z_ENTRY
+Z_EXIT  = 0.0   # stäng när z har gått tillbaka till ±Z_EXIT (gapet Z_ENTRY − Z_EXIT = förväntad vinst per affär i std)
 Z_STOP  = None  # stop-loss när |z| > Z_STOP (mot låst medel/std om FREEZE_AT_ENTRY, annars mot det rörliga). None = av.
                 #   OBS: med FREEZE_AT_ENTRY ligger failsafe-nivån vid z ≈ Z_ENTRY + FAILSAFE_STD, så ett Z_STOP under
                 #   det slår alltid till först och failsafe-nivån gör ingen skillnad.
-FAILSAFE_STD = 4.0  # failsafe: fast spreadnivå som låses när positionen öppnas, FAILSAFE_STD standardavvikelser
+FAILSAFE_STD = 3.0  # None = ingen failsafe. Tal = failsafe: fast spreadnivå som låses när positionen öppnas, FAILSAFE_STD standardavvikelser
                     #   längre bort än inträdet (inträde vid z = 1.5 → failsafe vid z ≈ 5.5 mot inträdets medel).
                     #   Når spreaden nivån stängs positionen direkt, oavsett var EWMA-medlet har tagit vägen.
 CAPITAL_PER_PAIR = 1.0  # kapital i ben A; ben B får beta * kapital
@@ -191,11 +214,11 @@ def plot_pair_prices(df, pairs, log=False):
 
 
 # ================================= 1. URVAL ==================================
-def select_pairs(prices, n=None, min_corr=None):
-    """Kandidatpar: de n mest (positivt) korrelerade paren på TRÄNINGSPERIODEN, och bara de med korrelation ≥ min_corr.
-    Returnerar en serie (a, b) → korrelation. Utan argument används N_TRADE_PAIRS och MIN_CORR."""
+def select_pairs(prices, n=None, min_corr=None, start=None, end=None):
+    """Kandidatpar: de n mest (positivt) korrelerade paren på [start, end] (standard: träningsperioden), och bara de
+    med korrelation ≥ min_corr. Returnerar en serie (a, b) → korrelation. Utan argument används N_TRADE_PAIRS och MIN_CORR."""
     n, min_corr = n or N_TRADE_PAIRS, MIN_CORR if min_corr is None else min_corr
-    corr = top_pairs(prices.loc[TRAIN_START:TRAIN_END], n, by_abs=False, verbose=False)
+    corr = top_pairs(prices.loc[start or TRAIN_START:end or TRAIN_END], n, by_abs=False, verbose=False)
     return corr[corr >= min_corr]
 
 
@@ -256,6 +279,8 @@ def spread_metrics(s):
     """De fyra screeningmåtten för en spread s (array eller serie; NaN tas bort)."""
     s = np.asarray(s, float)
     s = s[~np.isnan(s)]
+    if len(s) < 60:  # för kort serie (t.ex. facit efter en sen omscreening): måtten går inte att skatta
+        return dict(adf_t=np.nan, hurst=np.nan, half_life=np.nan, cross_per_year=np.nan)
     return dict(adf_t=adf_tstat(s), hurst=hurst_exponent(s), half_life=half_life_days(s),
                 cross_per_year=zero_crossings_per_year(s))
 
@@ -304,55 +329,100 @@ def validate_pair(prices, a, b, start=None, end=None):
     #    men får INTE användas för att välja par (det vore lookahead).
     facit = spread_metrics(trade_spread[trade_spread.index > pd.Timestamp(end)])
 
-    return dict(a=a, b=b, alpha=alpha, beta=beta, **metrics, checks=checks, coint_ok=coint_ok, facit=facit,
+    return dict(a=a, b=b, train_start=start, train_end=end, alpha=alpha, beta=beta, **metrics, checks=checks,
+                coint_ok=coint_ok, facit=facit,
                 spread=spread, alpha_t=alpha_t, beta_t=beta_t, trade_spread=trade_spread)
 
 
 # ========================= 3. FAS 2: LÖPANDE HANDEL ===========================
-def trade_pair(prices, v, capital=CAPITAL_PER_PAIR):
-    """FAS 2 för ett par v (från validate_pair): går igenom handelsperioden dag för dag.
-    Allt som räknas dag t använder bara data t.o.m. dag t, så ingen lookahead.
-    (Lynx-konvention: en position daterad t handlas dag t+1 och ger avkastning från dag t+2; det sköter evaluation.py.)
-
-    Returnerar (days, trades):
-      days   = DataFrame per dag: spread, EWMA-medel/-std, z-score, z_trade (z mot låsta värden under en affär),
-               pos (+1/-1/0) och antal enheter i A och B
-      trades = lista med en dict per affär (in/ut-datum, z, spread, failsafe-nivå, skäl till stängning)"""
-    a, b = v["a"], v["b"]
-    log_a, log_b = np.log(prices[a]), np.log(prices[b])
+def _band_params(v):
+    """Parametrar för z-scoren från v:s träningsfönster (bara historik → ingen lookahead).
+    Returnerar (fasta parametrar, startläge för de löpande EWMA-värdena)."""
     S = v["trade_spread"]  # spreaden vi handlar på (rullande eller låst beta, se validate_pair)
+    start, end = v["train_start"], v["train_end"]
 
     # EWMA-minne för MEDELVÄRDET sätts av parets egen återgångstid: span = SPAN_MEAN_MULT × half-life, lambda = 2 / (span + 1).
     # STD får ett eget, fast span (SPAN_STD) så att banden inte krymper i lugna perioder eller blåser upp vid enstaka hopp.
     span_mean = SPAN_MEAN_MULT * v["half_life"]
-    lam_mean = 2 / (span_mean + 1)
+    lam_mean = 0.0 if MEAN_MODE == "noll" else 2 / (span_mean + 1)  # lam 0 + startvärde 0 → medlet står kvar på 0
     lam_std = 2 / ((SPAN_STD or span_mean) + 1)
 
-    # Startvärden från träningsperioden (bara historik → ingen lookahead), se BAND_SCALE:
+    # Startvärden från träningsfönstret, se BAND_SCALE:
     #   "avvikelse": EWMA-medlet körs genom träningen och std = typisk avvikelse från det (samma sak som z-scoren mäter)
     #   "nivå":      medel och std för spreadens nivå i träningen (inkl. långsam drift → bredare band)
-    s_train = S.loc[TRAIN_START:TRAIN_END].dropna()
-    mean_path = s_train.ewm(alpha=lam_mean, adjust=False).mean()
+    s_train = S.loc[start:end].dropna()
+    if MEAN_MODE == "noll":
+        mean_path = pd.Series(0.0, index=s_train.index)
+    else:
+        mean_path = s_train.ewm(alpha=lam_mean, adjust=False).mean()
     dev_train = s_train - mean_path
-    if BAND_SCALE == "avvikelse":
+    if MEAN_MODE == "noll":  # avvikelsen från medlet är spreaden själv, oavsett BAND_SCALE
+        mean, var = 0.0, (dev_train ** 2).mean()
+    elif BAND_SCALE == "avvikelse":
         mean, var = mean_path.iloc[-1], (dev_train ** 2).mean()
     else:  # "nivå"
         mean, var = s_train.mean(), s_train.var()
-    std_train = np.sqrt(var)                                 # ankaret i STD_MODE = "shrink"
-    n_all, sumsq_all = len(dev_train), (dev_train ** 2).sum()  # för STD_MODE = "expanding"
+    std_train = np.sqrt(var)  # ankaret i STD_MODE = "shrink"
 
     # Svängningar = förändring över SWING_HORIZON dagar. Typisk storlek i träningen + löpande EWMA (för VOL_ADAPT).
     swing = S - S.shift(SWING_HORIZON)
-    swing_train = swing.loc[TRAIN_START:TRAIN_END].std()
-    swing_var, lam_swing = swing_train ** 2, 2 / (SWING_SPAN + 1)
+    swing_train = swing.loc[start:end].std()
+    lam_swing = 2 / (SWING_SPAN + 1)
     # Variance ratio på de senaste VR_WINDOW dagarna, bara bakåt i tiden (för TREND_FILTER)
     vr = swing.rolling(VR_WINDOW).var() / (SWING_HORIZON * S.diff().rolling(VR_WINDOW).var())
-    z_prev = 0.0
 
+    # Inträdesgräns: kvantil av |z| i fönstret, z mätt som avvikelse / typisk avvikelse (RMS) i fönstret
+    if ENTRY_FREQ:
+        z_train = dev_train / np.sqrt((dev_train ** 2).mean())
+        z_entry = float(np.quantile(np.abs(z_train), 1 - ENTRY_FREQ))
+    else:
+        z_entry = Z_ENTRY
+
+    params = (S, lam_mean, lam_std, std_train, swing, swing_train, lam_swing, vr, z_entry)
+    running = (mean, var, len(dev_train), (dev_train ** 2).sum(), swing_train ** 2)  # mean, var, n_all, sumsq_all, swing_var
+    return params, running
+
+
+def trade_pair(prices, v, capital=CAPITAL_PER_PAIR, segments=None):
+    """FAS 2 för ett par v (från validate_pair): går igenom handelsperioden dag för dag.
+    Allt som räknas dag t använder bara data t.o.m. dag t, så ingen lookahead.
+    (Lynx-konvention: en position daterad t handlas dag t+1 och ger avkastning från dag t+2; det sköter evaluation.py.)
+
+    segments = [(från_datum, v eller None), ...] vid löpande omscreening: från varje datum gäller den screeningens
+    parametrar (half-life, band); None = paret klarar inte kraven just då → inga nya affärer, en öppen affär sköts
+    tills den stängs. Utan segments screenas paret en gång: v gäller från första dagen efter dess träningsfönster.
+
+    Returnerar (days, trades):
+      days   = DataFrame per dag: spread, EWMA-medel/-std, z-score, z_trade (z mot låsta värden under en affär),
+               pos (+1/-1/0), antal enheter i A och B, och aktiv (= paret godkänt i senaste screeningen)
+      trades = lista med en dict per affär (in/ut-datum, z, spread, failsafe-nivå, skäl till stängning)"""
+    a, b = v["a"], v["b"]
+    log_a, log_b = np.log(prices[a]), np.log(prices[b])
+    if segments is None:
+        segments = [(prices.index[prices.index > pd.Timestamp(v["train_end"])][0], v)]
+
+    z_prev = 0.0
     pos, units_a, units_b, trade = 0, 0.0, 0.0, None
     blocked = False  # efter stop-loss/failsafe: vänta tills |z| < Z_ENTRY, annars öppnas samma förlustaffär igen direkt
+    active, started, k, v_cur = False, False, 0, None
     days, trades = [], []
-    for t, s in S.loc[TRAIN_END:].iloc[1:].items():      # första handelsdagen efter TRAIN_END och framåt
+    for t in prices.index[prices.index >= segments[0][0]]:
+        # 0. Ny screening från och med dag t: byt till dess parametrar. Med rullande beta är spreaden densamma, så de
+        #    löpande EWMA-värdena fortsätter; med låst beta är det en ny spread och de startas om från fönstret.
+        while k < len(segments) and t >= segments[k][0]:
+            v_k = segments[k][1]
+            k += 1
+            same = v_k is not None and v_k is v_cur
+            active, v_cur = v_k is not None, v_k
+            if active and not same:
+                (S, lam_mean, lam_std, std_train, swing, swing_train, lam_swing, vr, z_entry), running = _band_params(v_k)
+                if not started or not ROLLING_BETA:
+                    mean, var, n_all, sumsq_all, swing_var = running
+                    started = True
+        if not started:  # paret har ännu inte klarat någon screening
+            days.append((t, np.nan, np.nan, np.nan, np.nan, np.nan, 0, 0.0, 0.0, False, np.nan))
+            continue
+        s = S[t]
         # 1. Uppdatera rörligt medelvärde och EWMA-varians rekursivt med dagens spread
         mean = lam_mean * s + (1 - lam_mean) * mean
         dev = s - mean                                       # dagens avvikelse från medlet
@@ -375,16 +445,16 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR):
 
         # 3. Z-score: hur många standardavvikelser spreaden ligger från sitt rörliga jämviktsläge (används för inträde)
         z = (s - mean) / std
-        blocked = blocked and abs(z) >= Z_ENTRY
+        blocked = blocked and abs(z) >= z_entry
         z_trade = np.nan
 
         # 4a. Ingen position: öppna om avvikelsen är stor nog
-        if pos == 0 and not blocked:
+        if pos == 0 and not blocked and active:
             if ENTRY_CONFIRM:  # vändning: igår utanför bandet, idag tillbaka innanför (men fortfarande långt från medel)
-                go_short = z_prev > Z_ENTRY >= z > Z_EXIT
-                go_long = z_prev < -Z_ENTRY <= z < -Z_EXIT
+                go_short = z_prev > z_entry >= z > Z_EXIT
+                go_long = z_prev < -z_entry <= z < -Z_EXIT
             else:
-                go_short, go_long = z > Z_ENTRY, z < -Z_ENTRY
+                go_short, go_long = z > z_entry, z < -z_entry
             if TREND_FILTER and not vr[t] < VR_MAX:  # spreaden beter sig som trend/random walk just nu → vänta
                 go_short = go_long = False
             if go_short:         # spreaden hög: A dyr relativt B → short spread (blanka A, köp B)
@@ -402,7 +472,7 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR):
                 # som kan springa ikapp spreaden.
                 mean_in, std_in = mean, std
                 # Failsafe: fast spreadnivå längre bort i förlustriktningen (short: ovanför, long: nedanför).
-                failsafe = s - pos * FAILSAFE_STD * std
+                failsafe = s - pos * FAILSAFE_STD * std if FAILSAFE_STD is not None else np.nan
                 trade = dict(a=a, b=b, riktning="long spread" if pos > 0 else "short spread", in_datum=t,
                              z_in=z, spread_in=s, beta_in=beta_in, mean_in=mean_in, std_in=std_in, failsafe=failsafe,
                              enheter_a=units_a, enheter_b=units_b)
@@ -410,14 +480,19 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR):
 
         # 4b. Öppen position: stäng vid återgång, stop-loss eller failsafe
         elif pos != 0:
-            # Spreaden för de enheter vi faktiskt håller (alpha/beta från inträdet) – det är den som ger PnL.
-            s_trade = log_a[t] - (alpha_in + beta_in * log_b[t])
+            if REHEDGE:  # hedga om till dagens beta: det vi håller är spreaden S som handlas
+                units_a = pos * capital / prices.at[t, a]
+                units_b = -pos * capital * v["beta_t"][t] / prices.at[t, b]
+                s_trade = s
+            else:        # spreaden för de låsta enheterna (alpha/beta från inträdet) – det är den som ger PnL
+                s_trade = log_a[t] - (alpha_in + beta_in * log_b[t])
             z_trade = (s_trade - mean_in) / std_in if FREEZE_AT_ENTRY else z
             if (pos == -1 and z_trade <= Z_EXIT) or (pos == +1 and z_trade >= -Z_EXIT):
                 reason = "tillbaka vid medel"
             elif Z_STOP is not None and abs(z_trade) >= Z_STOP:
                 reason = "stop-loss (z)"
-            elif (pos == -1 and s_trade >= trade["failsafe"]) or (pos == +1 and s_trade <= trade["failsafe"]):
+            elif FAILSAFE_STD is not None and ((pos == -1 and s_trade >= trade["failsafe"])
+                                               or (pos == +1 and s_trade <= trade["failsafe"])):
                 reason = "failsafe (spreadnivå)"
             else:
                 reason = None
@@ -426,47 +501,88 @@ def trade_pair(prices, v, capital=CAPITAL_PER_PAIR):
                 pos, units_a, units_b, trade = 0, 0.0, 0.0, None
                 blocked = reason != "tillbaka vid medel"
 
-        days.append((t, s, mean, std, z, z_trade, pos, units_a, units_b))
+        days.append((t, s, mean, std, z, z_trade, pos, units_a, units_b, active, z_entry))
         z_prev = z
 
     if trade is not None:  # position som fortfarande är öppen när datan tar slut
         trades.append(trade | dict(ut_datum=t, z_ut=z_trade, spread_ut=s_trade, skäl="öppen vid periodens slut"))
-    days = pd.DataFrame(days, columns=["AsOfDate", "spread", "mean", "std", "z", "z_trade", "pos", "units_a", "units_b"]
+    days = pd.DataFrame(days, columns=["AsOfDate", "spread", "mean", "std", "z", "z_trade", "pos", "units_a", "units_b",
+                                       "aktiv", "z_entry"]
                         ).set_index("AsOfDate")
     return days, trades
 
 
-def trade_pnl(prices, tr):
-    """Resultat för en affär utan kostnader, med Lynx tidsförskjutning: signal dag t → handel på stängningskursen dag t+1."""
+def trade_pnl(prices, tr, days=None):
+    """Resultat för en affär utan kostnader, med Lynx tidsförskjutning: signal dag t → handel på stängningskursen dag t+1.
+    Med days (parets dagliga enheter) summeras resultatet dag för dag, så att omhedgning räknas med:
+    positionen daterad d ger P(d+2) − P(d+1)."""
+    if days is not None:
+        legs = [tr["a"], tr["b"]]
+        dp = prices[legs].diff().shift(-2).loc[tr["in_datum"]:tr["ut_datum"]].values
+        units = days.loc[tr["in_datum"]:tr["ut_datum"], ["units_a", "units_b"]].values
+        return float(np.nansum(units * dp))
     i = prices.index
     t_in = i[min(i.get_loc(tr["in_datum"]) + 1, len(i) - 1)]
     t_out = i[min(i.get_loc(tr["ut_datum"]) + 1, len(i) - 1)]
     return sum(tr[f"enheter_{leg}"] * (prices.at[t_out, tr[leg]] - prices.at[t_in, tr[leg]]) for leg in ("a", "b"))
 
 
+def screening_windows(prices):
+    """Screeningtillfällen: [(handel_från, fönster_start, fönster_slut), ...]. Utan RESCREEN_DAYS ett enda:
+    träningsperioden. Annars var RESCREEN_DAYS:e handelsdag, på de RESCREEN_WINDOW handelsdagarna före."""
+    idx = prices.index
+    trade_idx = idx[idx > pd.Timestamp(TRAIN_END)]
+    if not RESCREEN_DAYS:
+        return [(trade_idx[0], TRAIN_START, TRAIN_END)]
+    n_win = RESCREEN_WINDOW or ((idx >= pd.Timestamp(TRAIN_START)) & (idx <= pd.Timestamp(TRAIN_END))).sum()
+    return [(t, idx[max(0, idx.get_loc(t) - n_win)], idx[idx.get_loc(t) - 1]) for t in trade_idx[::RESCREEN_DAYS]]
+
+
 def run_strategy(prices):
-    """Urval → FAS 1 → FAS 2 för varje kandidatpar.
+    """Urval → FAS 1 → FAS 2 för varje kandidatpar, med omscreening var RESCREEN_DAYS:e dag om den är påslagen.
     Returnerar (results, positions, trades):
-      results   = en dict per kandidatpar (mått från fas 1, plus 'days' och 'trades' för handlade par)
+      results   = en dict per kandidatpar (mått från fas 1, plus 'days' och 'trades' för handlade par).
+                  Vid omscreening: måtten från första screeningen där paret var kandidat, 'n_passed' = antal
+                  screeningar paret klarade och 'n_screens' = antal screeningar
       positions = antal enheter per tillgång och dag, summerat över paren (Lynx-format)
       trades    = affärslista som DataFrame, en rad per affär"""
+    windows = screening_windows(prices)
+    screened = {}  # (a, b) → {screening nr: v}, bara screeningar där paret var kandidat
+    for k, (_, w_start, w_end) in enumerate(windows):
+        for (a, b), corr in select_pairs(prices, start=w_start, end=w_end).items():
+            v = validate_pair(prices, a, b, w_start, w_end)
+            v["corr"] = corr
+            # Handla paret om bruset har någon återgång alls (ändlig half-life) och, med REQUIRE_COINT, klarar fas 1-kraven
+            v["passed"] = bool(np.isfinite(v["half_life"]) and (v["coint_ok"] or not REQUIRE_COINT)
+                               and v["trade_spread"].loc[w_start:w_end].notna().sum() >= 60)  # rullande β kräver historik
+            screened.setdefault((a, b), {})[k] = v
+
     results = []
     positions = pd.DataFrame(0.0, index=prices.index[prices.index > TRAIN_END], columns=prices.columns)
-    for (a, b), corr in select_pairs(prices).items():
-        v = validate_pair(prices, a, b)
-        v["corr"] = corr
-        # Handla paret om bruset har någon återgång alls (ändlig half-life) och, med REQUIRE_COINT, klarar fas 1-kraven
-        v["traded"] = bool(np.isfinite(v["half_life"]) and (v["coint_ok"] or not REQUIRE_COINT))
+    for (a, b), by_screen in screened.items():
+        v = next(iter(by_screen.values())) | {}  # första screeningen där paret var kandidat (för tabeller och plottar)
+        segments, last = [], None  # last = senaste godkända screeningen (nr, v)
+        for k, (t, _, _) in enumerate(windows):
+            if k in by_screen and by_screen[k]["passed"]:
+                last = (k, by_screen[k])
+            valid = last is not None and (last[0] == k or (APPROVAL_DAYS is not None and
+                                          prices.index.get_loc(t) - prices.index.get_loc(windows[last[0]][0]) < APPROVAL_DAYS))
+            segments.append((t, last[1] if valid else None))
+        v["n_passed"] = sum(v_k["passed"] for v_k in by_screen.values())
+        v["n_screens"] = len(windows)
+        v["traded"] = any(seg is not None for _, seg in segments)
         if v["traded"]:
-            v["days"], v["trades"] = trade_pair(prices, v)
+            v["days"], v["trades"] = trade_pair(prices, v, segments=segments)
             positions[a] += v["days"]["units_a"]  # en tillgång kan ingå i flera par
             positions[b] += v["days"]["units_b"]
         results.append(v)
 
+    for v in results:
+        for tr in v.get("trades", []):
+            tr["resultat_%"] = 100 * trade_pnl(prices, tr, v["days"]) / CAPITAL_PER_PAIR
     trades = pd.DataFrame([tr for v in results for tr in v.get("trades", [])])
     if not trades.empty:
         trades["dagar"] = [prices.index.get_loc(o) - prices.index.get_loc(i) for i, o in zip(trades["in_datum"], trades["ut_datum"])]
-        trades["resultat_%"] = [100 * trade_pnl(prices, tr) / CAPITAL_PER_PAIR for _, tr in trades.iterrows()]
         trades.index += 1
     return results, positions, trades
 
@@ -512,7 +628,7 @@ def screening_table(results):
         rows[f"{v['a']} / {v['b']}"] = dict(
             korr=v["corr"], beta=v["beta"], **{m: v[m] for m in METRICS}, eg_nivå=eg_level(v["adf_t"]),
             **{f"ok_{k}": ok for k, ok in v["checks"].items()}, krav_klarade=sum(v["checks"].values()),
-            klarar_alla=v["coint_ok"], handlas=v["traded"],
+            klarar_alla=v["coint_ok"], handlas=v["traded"], godkänd=f"{v['n_passed']}/{v['n_screens']}",
             **{f"facit_{m}": v["facit"][m] for m in METRICS}, **{f"facit_ok_{k}": ok for k, ok in facit_checks.items()},
             facit_krav_klarade=sum(facit_checks.values()))
     return pd.DataFrame.from_dict(rows, orient="index")
@@ -534,10 +650,16 @@ def print_screening(table):
             show["EG-nivå"] = table["eg_nivå"]
     show["krav"] = table["krav_klarade"].map("{}/4".format)
     show["beslut"] = table["handlas"].map({True: "HANDLAS", False: "handlas ej"})
+    if RESCREEN_DAYS:
+        show["godkänd"] = table["godkänd"]
     print(f"\nSCREENING på träningsdata {TRAIN_START} – {TRAIN_END}  (krav: ADF-t < {ADF_CRIT}, Hurst < {HURST_MAX}, "
           f"{HL_MIN} ≤ HL ≤ {HL_MAX} d, ≥ {MIN_CROSS_PER_YEAR} nollgenomgångar/år)")
     if not REQUIRE_COINT:
         print("OBS: REQUIRE_COINT = False → alla kandidater handlas oavsett krav")
+    if RESCREEN_DAYS:
+        print(f"OMSCREENING var {RESCREEN_DAYS}:e handelsdag, ett godkännande gäller {APPROVAL_DAYS} handelsdagar. Måtten nedan är från första screeningen där paret var "
+              "kandidat; 'godkänd' = antal screeningar paret klarade av alla. Paret handlas (nya affärer) bara i "
+              "perioderna efter en godkänd screening.")
     print(show.to_string(), "\n")
 
     facit = pd.DataFrame(index=table.index)
@@ -654,38 +776,48 @@ def plot_trades(prices, v):
     # 1) Brustermen: träningsperioden (grått fält) och handelsperioden med EWMA-medel ± Z_ENTRY std
     ax1.plot(v["trade_spread"].loc[TRAIN_START:], lw=0.9, c="C0", label="spread som handlas")
     ax1.axvspan(pd.Timestamp(TRAIN_START), pd.Timestamp(TRAIN_END), color="grey", alpha=0.12, label="träning")
-    ax1.plot(days["mean"], c="k", lw=0.8, label="EWMA-medel")
-    ax1.fill_between(days.index, days["mean"] - Z_ENTRY * days["std"], days["mean"] + Z_ENTRY * days["std"],
-                     color="grey", alpha=0.25, label=f"± {Z_ENTRY} std (inträde utanför)")
+    ax1.plot(days["mean"], c="k", lw=0.8, label="medel (fast 0)" if MEAN_MODE == "noll" else "EWMA-medel")
+    if not days["aktiv"].all():  # omscreening: perioder där paret inte klarade senaste screeningen
+        ax1.fill_between(days.index, 0, 1, where=~days["aktiv"].astype(bool), transform=ax1.get_xaxis_transform(),
+                         color="tab:red", alpha=0.07, step="post", label="ej godkänd (inga nya affärer)")
+    entry_lbl = f"± dynamisk gräns ({ENTRY_FREQ:.0%} av dagarna utanför)" if ENTRY_FREQ else f"± {Z_ENTRY} std"
+    ax1.fill_between(days.index, days["mean"] - days["z_entry"] * days["std"], days["mean"] + days["z_entry"] * days["std"],
+                     color="grey", alpha=0.25, label=f"{entry_lbl} (inträde utanför)")
     for tr in v["trades"]:
         long = tr["riktning"] == "long spread"
         ax1.scatter(tr["in_datum"], tr["spread_in"], marker="^" if long else "v", s=60, zorder=3, c="green" if long else "red")
         stopped = tr["skäl"].startswith(("stop", "failsafe"))
         ax1.scatter(tr["ut_datum"], tr["spread_ut"], marker="x" if stopped else "o", s=45, zorder=3, c="red" if stopped else "k")
-        ax1.hlines(tr["failsafe"], tr["in_datum"], tr["ut_datum"], colors="red", linestyles="--", lw=0.9)
+        if FAILSAFE_STD is not None:
+            ax1.hlines(tr["failsafe"], tr["in_datum"], tr["ut_datum"], colors="red", linestyles="--", lw=0.9)
         if FREEZE_AT_ENTRY:  # låst exit-nivå: medel vid inträdet ± Z_EXIT std vid inträdet
             exit_level = tr["mean_in"] + (Z_EXIT if not long else -Z_EXIT) * tr["std_in"]
             ax1.hlines(exit_level, tr["in_datum"], tr["ut_datum"], colors="green", linestyles=":", lw=1.2)
-    ax1.plot([], [], "r--", lw=0.9, label="failsafe-nivå")
+    if FAILSAFE_STD is not None:
+        ax1.plot([], [], "r--", lw=0.9, label="failsafe-nivå")
     if FREEZE_AT_ENTRY:
         ax1.plot([], [], "g:", lw=1.2, label="exit-nivå (låst vid inträde)")
     ax1.legend(fontsize=7, loc="upper left", ncol=3)
+    medel = "medel=0" if MEAN_MODE == "noll" else f"span medel={SPAN_MEAN_MULT * v['half_life']:.1f} d"
     ax1.set_title(f"{a} / {b}:  korr={v['corr']:.2f}, β={v['beta']:.2f}, half-life={v['half_life']:.1f} d "
-                  f"→ span medel={SPAN_MEAN_MULT * v['half_life']:.1f} d, std: {STD_MODE}   (▲ long in, ▼ short in, ● ut vid medel, ✕ stop/failsafe)", fontsize=10)
+                  f"→ {medel}, std: {STD_MODE}   (▲ long in, ▼ short in, ● ut vid medel, ✕ stop/failsafe)", fontsize=10)
 
     # 2) Z-score med trösklar; grönt = long spread (köp A, blanka B), rött = short spread
-    ax2.plot(days["z"], lw=0.8, c="k", label="z (rörligt medel/std)")
+    ax2.plot(days["z"], lw=0.8, c="k", label="z = spread / std" if MEAN_MODE == "noll" else "z (rörligt medel/std)")
     if FREEZE_AT_ENTRY:
         ax2.plot(days["z_trade"], lw=1.0, c="C1", label="z mot låst medel/std (styr exit)")
-    for level, style in [(Z_ENTRY, "--"), (Z_EXIT, ":")] + ([(Z_STOP, "-")] if Z_STOP is not None else []):
+    ax2.plot(days["z_entry"], c="grey", ls="--", lw=0.8), ax2.plot(-days["z_entry"], c="grey", ls="--", lw=0.8)
+    for level, style in [(Z_EXIT, ":")] + ([(Z_STOP, "-")] if Z_STOP is not None else []):
         ax2.axhline(level, c="grey", ls=style, lw=0.8), ax2.axhline(-level, c="grey", ls=style, lw=0.8)
-    lim = max(Z_STOP or 0, Z_ENTRY + FAILSAFE_STD) + 1
+    lim = max(Z_STOP or 0, np.nanmax(days["z_entry"]) + (FAILSAFE_STD or 4)) + 1
     ax2.fill_between(days.index, -lim, lim, where=days["pos"] > 0, color="green", alpha=0.15, step="post", label="long spread")
     ax2.fill_between(days.index, -lim, lim, where=days["pos"] < 0, color="red", alpha=0.15, step="post", label="short spread")
     ax2.set_ylim(-lim, lim), ax2.legend(fontsize=7, loc="upper left")
-    ax2.set_title(f"z-score: in vid ±{Z_ENTRY} (streckad), ut vid ±{Z_EXIT} (prickad)"
+    in_txt = f"dynamisk {days['z_entry'].min():.2f}–{days['z_entry'].max():.2f}" if ENTRY_FREQ else f"±{Z_ENTRY}"
+    ax2.set_title(f"z-score: in vid {in_txt} (streckad), ut vid ±{Z_EXIT} (prickad)"
                   + (f", stop-loss vid ±{Z_STOP} (heldragen)" if Z_STOP is not None else "")
-                  + f", failsafe {FAILSAFE_STD} std bortom inträdet", fontsize=10)
+                  + (f", failsafe {FAILSAFE_STD} std bortom inträdet" if FAILSAFE_STD is not None else ", ingen failsafe"),
+                  fontsize=10)
 
     # 3) Ackumulerat resultat utan kostnader, med Lynx tidsförskjutning (position dag t ger avkastning från dag t+2)
     units = days[["units_a", "units_b"]].shift(evaluation.POSITION_LAG).values
